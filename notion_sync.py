@@ -13,7 +13,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 NOTION_API_KEY = os.getenv("NOTION_API_KEY", "")
-NOTION_DB_ID   = os.getenv("NOTION_DATABASE_ID", "98790a991cfb442d8a92dfb6d2004e04")
+NOTION_DB_ID   = os.getenv("NOTION_DATABASE_ID", "d7615138fbbd46b3b4688dc1a46befef")
 NOTION_API     = "https://api.notion.com/v1"
 NOTION_VER     = "2022-06-28"
 
