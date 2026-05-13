@@ -4,6 +4,7 @@ import json
 import time
 import base64
 from pathlib import Path
+from typing import Optional
 
 import httpx
 from fastapi import HTTPException
@@ -30,7 +31,7 @@ def basic_header() -> dict:
     return {"Authorization": f"Basic {encoded}"}
 
 
-def require_auth(secret: str | None) -> None:
+def require_auth(secret: Optional[str]) -> None:
     if not API_SECRET:
         raise HTTPException(500, "API_SECRET env var is not configured on the server")
     if secret != API_SECRET:

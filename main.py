@@ -2,6 +2,7 @@ import logging
 import os
 import secrets
 import time
+from typing import Optional
 
 import httpx
 import pytz
@@ -20,7 +21,7 @@ from tokens import (
     require_auth, get_valid_token, _do_refresh
 )
 from workorders import router as wo_router
-from notifier import run_stale_check
+from notifier import run_stale_check, send_teams_notification
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 logger = logging.getLogger(__name__)
@@ -130,7 +131,7 @@ class PasswordLoginBody(BaseModel):
 @app.post("/auth/login-password", summary="Authenticate directly with SC username + password", tags=["Auth"])
 async def login_password(
     body: PasswordLoginBody,
-    x_api_secret: str | None = Header(default=None),
+    x_api_secret: Optional[str] = Header(default=None),
 ):
     require_auth(x_api_secret)
 
@@ -153,7 +154,7 @@ async def login_password(
 # ── Token access ──────────────────────────────────────────────────────────────
 
 @app.get("/auth/token", summary="Get current access token (auto-refreshes)", tags=["Auth"])
-async def get_token(x_api_secret: str | None = Header(default=None)):
+async def get_token(x_api_secret: Optional[str] = Header(default=None)):
     require_auth(x_api_secret)
     tokens = load_tokens()
     if not tokens:
@@ -172,7 +173,7 @@ async def get_token(x_api_secret: str | None = Header(default=None)):
 
 
 @app.post("/auth/refresh", summary="Force-refresh the stored access token", tags=["Auth"])
-async def force_refresh(x_api_secret: str | None = Header(default=None)):
+async def force_refresh(x_api_secret: Optional[str] = Header(default=None)):
     require_auth(x_api_secret)
     tokens = load_tokens()
     if not tokens:
@@ -192,7 +193,7 @@ async def force_refresh(x_api_secret: str | None = Header(default=None)):
 async def proxy(
     path: str,
     request: Request,
-    x_api_secret: str | None = Header(default=None),
+    x_api_secret: Optional[str] = Header(default=None),
 ):
     require_auth(x_api_secret)
     token = await get_valid_token()
@@ -223,13 +224,37 @@ async def proxy(
 # ── Manual notification trigger ──────────────────────────────────────────────
 
 @app.post("/notify/check-now", summary="Run the stale WO check immediately and send Teams alert", tags=["Notifications"])
-async def check_now(x_api_secret: str | None = Header(default=None)):
+async def check_now(x_api_secret: Optional[str] = Header(default=None)):
     require_auth(x_api_secret)
-    count = await run_stale_check("Manual Check")
+    count = await run_stale_check("Manual Check", raise_errors=True)
     return {
         "status": "sent" if count >= 0 else "error",
         "stale_work_orders_found": count,
     }
+
+
+@app.post("/notify/test-webhook", summary="Send a sample Teams card to verify webhook connectivity", tags=["Notifications"])
+async def test_webhook(x_api_secret: Optional[str] = Header(default=None)):
+    require_auth(x_api_secret)
+    sample = [
+        {
+            "id":                "12345678",
+            "number":            "WO-12345678",
+            "store":             "Store #042 — Downtown",
+            "address":           "123 Main St, Chicago, IL 60601",
+            "trade":             "HVAC",
+            "priority":          "P2 - Urgent",
+            "status":            "IN PROGRESS",
+            "status_ext":        "PENDING PARTS",
+            "provider":          "ACME HVAC Services",
+            "description":       "A/C unit not cooling — reported by store manager. Vendor dispatched but parts on order.",
+            "scheduled_date":    "2026-05-20",
+            "days_old":          72,
+            "days_since_update": 18,
+        }
+    ]
+    ok = await send_teams_notification(sample, "Webhook Test")
+    return {"status": "ok" if ok else "failed", "webhook_configured": bool(os.getenv("TEAMS_WEBHOOK_URL"))}
 
 
 # ── Health ────────────────────────────────────────────────────────────────────

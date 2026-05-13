@@ -16,6 +16,7 @@ import json
 import os
 import sys
 from datetime import datetime
+from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
@@ -94,7 +95,7 @@ def show_wo(wo_id: int):
     print()
 
 
-def update_status(wo_id: int, primary: str, extended: str | None, note: str | None):
+def update_status(wo_id: int, primary: str, extended: Optional[str], note: Optional[str]):
     payload = {"primary": primary}
     if extended:
         payload["extended"] = extended
@@ -109,7 +110,7 @@ def add_note(wo_id: int, text: str):
     print(_color(f"  Note added to WO {wo_id}", "92"))
 
 
-def complete_wo(wo_id: int, note: str | None):
+def complete_wo(wo_id: int, note: Optional[str]):
     params = f"?note={note}" if note else ""
     _req("POST", f"/workorders/{wo_id}/complete{params}")
     print(_color(f"  WO {wo_id} marked COMPLETED", "92"))

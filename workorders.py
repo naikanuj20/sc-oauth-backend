@@ -93,7 +93,7 @@ def _fmt_wo(wo: dict) -> dict:
 # ── Daily dashboard ───────────────────────────────────────────────────────────
 
 @router.get("/dashboard", summary="Daily digest — all open & in-progress WOs grouped by status")
-async def daily_dashboard(x_api_secret: str | None = Header(default=None)):
+async def daily_dashboard(x_api_secret: Optional[str] = Header(default=None)):
     require_auth(x_api_secret)
 
     filter_q = "(Status/Primary eq 'OPEN' or Status/Primary eq 'IN PROGRESS' or Status/Primary eq 'ON HOLD')"
@@ -129,7 +129,7 @@ async def daily_dashboard(x_api_secret: str | None = Header(default=None)):
 async def list_work_orders(
     status: str = "OPEN",
     limit: int = 50,
-    x_api_secret: str | None = Header(default=None),
+    x_api_secret: Optional[str] = Header(default=None),
 ):
     require_auth(x_api_secret)
     data = await _sc_get(
@@ -144,7 +144,7 @@ async def list_work_orders(
 # ── Detail ────────────────────────────────────────────────────────────────────
 
 @router.get("/{wo_id}", summary="Full details of a single work order")
-async def get_work_order(wo_id: int, x_api_secret: str | None = Header(default=None)):
+async def get_work_order(wo_id: int, x_api_secret: Optional[str] = Header(default=None)):
     require_auth(x_api_secret)
     raw = await _sc_get(f"/v3/workorders/{wo_id}")
     return _fmt_wo(raw)
@@ -156,7 +156,7 @@ async def get_work_order(wo_id: int, x_api_secret: str | None = Header(default=N
 async def update_status(
     wo_id: int,
     body: StatusUpdate,
-    x_api_secret: str | None = Header(default=None),
+    x_api_secret: Optional[str] = Header(default=None),
 ):
     require_auth(x_api_secret)
 
@@ -181,7 +181,7 @@ async def update_status(
 async def add_note(
     wo_id: int,
     body: NoteCreate,
-    x_api_secret: str | None = Header(default=None),
+    x_api_secret: Optional[str] = Header(default=None),
 ):
     require_auth(x_api_secret)
     token = await get_valid_token()
@@ -224,7 +224,7 @@ async def add_note(
 @router.post("", summary="Create a new service request / work order", status_code=201)
 async def create_work_order(
     body: WorkOrderCreate,
-    x_api_secret: str | None = Header(default=None),
+    x_api_secret: Optional[str] = Header(default=None),
 ):
     require_auth(x_api_secret)
 
@@ -255,7 +255,7 @@ async def create_work_order(
 async def complete_work_order(
     wo_id: int,
     note: Optional[str] = None,
-    x_api_secret: str | None = Header(default=None),
+    x_api_secret: Optional[str] = Header(default=None),
 ):
     require_auth(x_api_secret)
     payload: dict = {
