@@ -1,9 +1,13 @@
+import logging
 import os
 import secrets
 import time
 
 import httpx
+import pytz
 import uvicorn
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import RedirectResponse, HTMLResponse
 from pydantic import BaseModel
@@ -16,6 +20,12 @@ from tokens import (
     require_auth, get_valid_token, _do_refresh
 )
 from workorders import router as wo_router
+from notifier import run_stale_check
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
+logger = logging.getLogger(__name__)
+
+NOTIFY_TZ = os.getenv("NOTIFY_TZ", "America/New_York")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CLIENT_ID    = os.getenv("SC_CLIENT_ID", "")
@@ -26,9 +36,34 @@ SC_API_BASE  = os.getenv("SC_API_BASE",  "https://api.servicechannel.com")
 app = FastAPI(
     title="ServiceChannel Automation Backend",
     description="OAuth 2.0 auth + work order automation for ServiceChannel",
-    version="2.0.0",
+    version="3.0.0",
 )
 app.include_router(wo_router)
+
+
+@app.on_event("startup")
+async def start_scheduler():
+    try:
+        tz = pytz.timezone(NOTIFY_TZ)
+    except Exception:
+        tz = pytz.utc
+        logger.warning("Invalid NOTIFY_TZ '%s', falling back to UTC", NOTIFY_TZ)
+
+    scheduler = AsyncIOScheduler(timezone=tz)
+    scheduler.add_job(
+        run_stale_check,
+        CronTrigger(hour=9, minute=0, timezone=tz),
+        args=["Morning Check (9 AM)"],
+        id="morning_check",
+    )
+    scheduler.add_job(
+        run_stale_check,
+        CronTrigger(hour=15, minute=0, timezone=tz),
+        args=["Afternoon Check (3 PM)"],
+        id="afternoon_check",
+    )
+    scheduler.start()
+    logger.info("Scheduler started — checks at 9 AM and 3 PM %s", NOTIFY_TZ)
 
 # ── OAuth: Authorization Code flow ────────────────────────────────────────────
 _pending_states: dict[str, float] = {}
@@ -183,6 +218,18 @@ async def proxy(
     if "application/json" in resp.headers.get("content-type", ""):
         return resp.json()
     return {"status_code": resp.status_code, "body": resp.text}
+
+
+# ── Manual notification trigger ──────────────────────────────────────────────
+
+@app.post("/notify/check-now", summary="Run the stale WO check immediately and send Teams alert", tags=["Notifications"])
+async def check_now(x_api_secret: str | None = Header(default=None)):
+    require_auth(x_api_secret)
+    count = await run_stale_check("Manual Check")
+    return {
+        "status": "sent" if count >= 0 else "error",
+        "stale_work_orders_found": count,
+    }
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
