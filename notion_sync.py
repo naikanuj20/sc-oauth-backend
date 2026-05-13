@@ -209,7 +209,7 @@ async def upsert_workorder(wo: dict) -> bool:
 
 
 async def sync_workorders(wos: list[dict]) -> dict:
-    """Upsert a batch of WO dicts to Notion. Returns {synced, failed}."""
+    """Upsert active WOs to Notion then archive any that are no longer active."""
     if not NOTION_API_KEY:
         return {"skipped": True, "reason": "NOTION_API_KEY not configured"}
     ok = fail = 0
@@ -219,4 +219,92 @@ async def sync_workorders(wos: list[dict]) -> dict:
         else:
             fail += 1
     logger.info("Notion batch sync complete: %d synced, %d failed", ok, fail)
-    return {"synced": ok, "failed": fail}
+
+    active_numbers = {str(wo.get("number") or wo.get("id", "")) for wo in wos}
+    archived = await archive_completed_pages(active_numbers)
+    return {"synced": ok, "failed": fail, "archived": archived}
+
+
+async def archive_completed_pages(active_wo_numbers: set) -> int:
+    """Archive Notion pages for WOs that are no longer open/in-progress in SC."""
+    if not NOTION_API_KEY:
+        return 0
+    archived = 0
+    has_more = True
+    cursor = None
+    async with httpx.AsyncClient(timeout=30) as client:
+        while has_more:
+            payload: dict = {"page_size": 100, "filter": {"property": "Status", "select": {"does_not_equal": "ARCHIVED"}}}
+            if cursor:
+                payload["start_cursor"] = cursor
+            resp = await client.post(
+                f"{NOTION_API}/databases/{NOTION_DB_ID}/query",
+                headers=_headers(),
+                json=payload,
+            )
+            if not resp.is_success:
+                logger.error("Notion query failed during archive sweep: %s", resp.text[:200])
+                break
+            data = resp.json()
+            for page in data.get("results", []):
+                if page.get("archived"):
+                    continue
+                props = page.get("properties", {})
+                title_arr = props.get("Work Order #", {}).get("title", [])
+                wo_num = title_arr[0].get("plain_text", "") if title_arr else ""
+                if wo_num and wo_num not in active_wo_numbers:
+                    patch = await client.patch(
+                        f"{NOTION_API}/pages/{page['id']}",
+                        headers=_headers(),
+                        json={"archived": True},
+                    )
+                    if patch.is_success:
+                        archived += 1
+                        logger.info("Archived Notion page for completed WO #%s", wo_num)
+            has_more = data.get("has_more", False)
+            cursor = data.get("next_cursor")
+    return archived
+
+
+async def query_recently_edited_pages(since_iso: str) -> list[dict]:
+    """Return pages in the tracker DB edited after `since_iso` (ISO timestamp)."""
+    if not NOTION_API_KEY:
+        return []
+    results = []
+    has_more = True
+    cursor = None
+    async with httpx.AsyncClient(timeout=30) as client:
+        while has_more:
+            payload: dict = {
+                "page_size": 50,
+                "filter": {
+                    "timestamp": "last_edited_time",
+                    "last_edited_time": {"after": since_iso},
+                },
+            }
+            if cursor:
+                payload["start_cursor"] = cursor
+            resp = await client.post(
+                f"{NOTION_API}/databases/{NOTION_DB_ID}/query",
+                headers=_headers(),
+                json=payload,
+            )
+            if not resp.is_success:
+                break
+            data = resp.json()
+            for page in data.get("results", []):
+                if page.get("archived"):
+                    continue
+                props = page.get("properties", {})
+                title_arr = props.get("Work Order #", {}).get("title", [])
+                wo_num = title_arr[0].get("plain_text", "") if title_arr else ""
+                status_sel = props.get("Status", {}).get("select") or {}
+                notion_status = status_sel.get("name", "")
+                # Notes field (if user typed a note in Notion to push to SC)
+                note_arr = props.get("Notes to SC", {}).get("rich_text", [])
+                note = note_arr[0].get("plain_text", "") if note_arr else ""
+                if wo_num and notion_status:
+                    results.append({"wo_num": wo_num, "status": notion_status, "note": note})
+            has_more = data.get("has_more", False)
+            cursor = data.get("next_cursor")
+    return results

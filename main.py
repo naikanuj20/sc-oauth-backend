@@ -2,6 +2,7 @@ import logging
 import os
 import secrets
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
@@ -9,6 +10,7 @@ import pytz
 import uvicorn
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import RedirectResponse, HTMLResponse
 from pydantic import BaseModel
@@ -22,7 +24,27 @@ from tokens import (
 )
 from workorders import router as wo_router
 from notifier import run_stale_check, send_teams_notification, fetch_all_active_workorders
-from notion_sync import sync_workorders, upsert_workorder
+from notion_sync import sync_workorders, upsert_workorder, query_recently_edited_pages
+
+SC_API = os.getenv("SC_API_BASE", "https://api.servicechannel.com")
+
+# Tracks the last time we pushed SC→Notion so the reverse-sync can ignore those
+_last_sc_to_notion: datetime = datetime.min.replace(tzinfo=timezone.utc)
+
+# Notion status → SC {primary, extended} mapping
+_NOTION_TO_SC: dict[str, dict] = {
+    "OPEN":                             {"primary": "OPEN"},
+    "IN PROGRESS":                      {"primary": "IN PROGRESS"},
+    "IN PROGRESS:PARTS ON ORDER":       {"primary": "IN PROGRESS", "extended": "PARTS ON ORDER"},
+    "IN PROGRESS:INCOMPLETE":           {"primary": "IN PROGRESS", "extended": "INCOMPLETE"},
+    "IN PROGRESS:DISPATCH CONFIRMED":   {"primary": "IN PROGRESS", "extended": "DISPATCH CONFIRMED"},
+    "IN PROGRESS:WAITING FOR QUOTE":    {"primary": "IN PROGRESS", "extended": "WAITING FOR QUOTE"},
+    "COMPLETED":                        {"primary": "COMPLETED"},
+    "COMPLETED:CONFIRMED":              {"primary": "COMPLETED", "extended": "CONFIRMED"},
+    "COMPLETED:NO CHARGE":              {"primary": "COMPLETED", "extended": "NO CHARGE"},
+    "INVOICED":                         {"primary": "INVOICED"},
+    "INVOICED:CONFIRMED":               {"primary": "INVOICED", "extended": "CONFIRMED"},
+}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 logger = logging.getLogger(__name__)
@@ -52,28 +74,101 @@ async def start_scheduler():
         logger.warning("Invalid NOTIFY_TZ '%s', falling back to UTC", NOTIFY_TZ)
 
     async def _notion_daily_sync():
-        """Full Notion sync — upserts every active WO into the tracker database."""
+        """Full Notion sync — upserts every active WO, archives completed ones."""
+        global _last_sc_to_notion
         logger.info("Starting daily Notion sync")
         try:
             wos = await fetch_all_active_workorders()
             result = await sync_workorders(wos)
+            _last_sc_to_notion = datetime.now(timezone.utc)
             logger.info("Daily Notion sync complete: %s", result)
         except Exception:
             logger.exception("Daily Notion sync failed")
 
     async def _stale_check_and_sync(label: str):
         """Stale WO check → Teams alert, then refresh Notion."""
+        global _last_sc_to_notion
         await run_stale_check(label)
         try:
             wos = await fetch_all_active_workorders()
             result = await sync_workorders(wos)
+            _last_sc_to_notion = datetime.now(timezone.utc)
             logger.info("Notion sync after %s: %s", label, result)
         except Exception:
             logger.exception("Notion sync failed after %s", label)
 
+    async def _notion_to_sc_sync():
+        """
+        Poll Notion for pages edited in the last 12 minutes.
+        If Status changed (and the change wasn't made by our own sync), push it to SC.
+        """
+        # Skip changes that were written by our own SC→Notion sync (+ 2 min buffer)
+        ignore_before = _last_sc_to_notion + timedelta(minutes=2)
+        since_dt = datetime.now(timezone.utc) - timedelta(minutes=12)
+        since_iso = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        try:
+            pages = await query_recently_edited_pages(since_iso)
+        except Exception:
+            logger.exception("Notion→SC: failed to query recent changes")
+            return
+
+        for entry in pages:
+            wo_num = entry["wo_num"]
+            notion_status = entry["status"].upper()
+            note = entry.get("note", "")
+
+            sc_map = _NOTION_TO_SC.get(notion_status)
+            if not sc_map:
+                continue
+
+            # Only process changes that happened after our last SC→Notion push
+            # (prevents circular updates when we write to Notion ourselves)
+            if since_dt < ignore_before:
+                logger.debug("Notion→SC: skipping WO #%s — likely written by our own sync", wo_num)
+                continue
+
+            try:
+                wo_id = int(wo_num.replace("WO-", "").strip())
+            except ValueError:
+                continue
+
+            token = await get_valid_token()
+            headers = {"Authorization": f"Bearer {token}", "Accept": "application/json",
+                       "Content-Type": "application/json"}
+            async with httpx.AsyncClient(timeout=15) as client:
+                # Fetch current SC status to avoid no-op pushes
+                sc_resp = await client.get(f"{SC_API}/v3/workorders/{wo_id}", headers=headers)
+                if not sc_resp.is_success:
+                    continue
+                sc_wo = sc_resp.json()
+                sc_primary = (sc_wo.get("Status") or {}).get("Primary", "").upper()
+                sc_extended = (sc_wo.get("Status") or {}).get("Extended", "").upper()
+                sc_combined = f"{sc_primary}:{sc_extended}" if sc_extended else sc_primary
+
+                if sc_combined == notion_status:
+                    continue  # Already in sync, nothing to push
+
+                payload: dict = {"Status": {"Primary": sc_map["primary"]}}
+                if sc_map.get("extended"):
+                    payload["Status"]["Extended"] = sc_map["extended"]
+                if note:
+                    payload["Note"] = note
+
+                upd = await client.put(
+                    f"{SC_API}/v3/workorders/{wo_id}/status", headers=headers, json=payload
+                )
+                if upd.is_success:
+                    logger.info(
+                        "Notion→SC: WO #%s status updated %s → %s",
+                        wo_num, sc_combined, notion_status,
+                    )
+                else:
+                    logger.error("Notion→SC: update failed for WO #%s: %s", wo_num, upd.text[:200])
+
     scheduler = AsyncIOScheduler(timezone=tz)
 
-    # 8 AM — full Notion sync (all active WOs refreshed before the workday starts)
+    # 8 AM — full Notion sync (upsert all active WOs, archive completed ones)
     scheduler.add_job(
         _notion_daily_sync,
         CronTrigger(hour=8, minute=0, timezone=tz),
@@ -93,9 +188,15 @@ async def start_scheduler():
         args=["Afternoon Check (3 PM)"],
         id="afternoon_check",
     )
+    # Every 10 min — pick up status changes made manually in Notion and push to SC
+    scheduler.add_job(
+        _notion_to_sc_sync,
+        IntervalTrigger(minutes=10),
+        id="notion_to_sc",
+    )
     scheduler.start()
     logger.info(
-        "Scheduler started — Notion sync 8 AM, Teams checks 9 AM & 3 PM (%s)",
+        "Scheduler started — Notion sync 8 AM, Teams checks 9 AM & 3 PM, Notion→SC every 10 min (%s)",
         NOTIFY_TZ,
     )
 
