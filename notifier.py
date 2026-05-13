@@ -5,9 +5,6 @@ A WO is considered "stale" when ALL of these are true:
   - Status is OPEN or IN PROGRESS
   - CallDate (creation) is older than STALE_DAYS  (default 60)
   - UpdatedDate (last activity) is older than FOLLOWUP_DAYS  (default 14)
-
-Teams notifications use Adaptive Cards format, which is required for
-Workflow-based webhooks (the current Teams standard).
 """
 import logging
 import os
@@ -80,7 +77,7 @@ async def find_stale_workorders() -> list[dict]:
         location = wo.get("Location") or wo.get("Store") or {}
         provider = wo.get("Provider") or {}
 
-        # Build a readable address from the location object
+        # Build readable address from location fields
         address_parts = []
         for field in ["Address", "City", "State", "ZipCode", "Zip"]:
             val = location.get(field)
@@ -88,7 +85,7 @@ async def find_stale_workorders() -> list[dict]:
                 address_parts.append(str(val).strip())
         address = ", ".join(address_parts)
 
-        # Priority can be a string or a nested object depending on SC API version
+        # Priority can be a string or nested object depending on SC API version
         priority_raw = wo.get("Priority") or ""
         if isinstance(priority_raw, dict):
             priority = priority_raw.get("Name") or priority_raw.get("Primary") or ""
@@ -128,123 +125,78 @@ async def find_stale_workorders() -> list[dict]:
     return stale
 
 
-# ── Teams Adaptive Card builder ───────────────────────────────────────────────
+# ── Teams MessageCard builder ─────────────────────────────────────────────────
 
 def _build_teams_card(wos: list[dict], run_label: str) -> dict:
-    """
-    Builds a Teams message payload using Adaptive Cards format.
-    This works with both new Workflow webhooks and legacy connectors.
-    """
+    """Builds a legacy Office 365 Connector MessageCard payload."""
     if not wos:
-        body = [
-            {
-                "type": "TextBlock",
-                "size": "Large",
-                "weight": "Bolder",
-                "color": "Good",
-                "text": f"✅ {run_label} — All Work Orders Up To Date",
-                "wrap": True,
-            },
-            {
-                "type": "TextBlock",
-                "text": (
-                    f"No open work orders older than **{STALE_DAYS} days** "
-                    f"are missing an update in the last **{FOLLOWUP_DAYS} days**."
-                ),
-                "wrap": True,
-                "isSubtle": True,
-            },
+        return {
+            "@type":      "MessageCard",
+            "@context":   "https://schema.org/extensions",
+            "themeColor": "00B050",
+            "summary":    "All WOs are up to date",
+            "title":      f"✅ {run_label} — All Work Orders Have Recent Follow-Ups",
+            "text": (
+                f"No open work orders older than **{STALE_DAYS} days** "
+                f"are missing an update in the last **{FOLLOWUP_DAYS} days**."
+            ),
+        }
+
+    sections = []
+    for wo in wos:
+        status_display = wo["status"]
+        if wo["status_ext"]:
+            status_display += f" / {wo['status_ext']}"
+
+        if wo["days_since_update"] > 30:
+            urgency = f"🔴 **URGENT** — no update in {wo['days_since_update']} days"
+        else:
+            urgency = f"🟠 {wo['days_since_update']} days since last update"
+
+        facts = [
+            {"name": "WO #",       "value": str(wo["number"])},
+            {"name": "Store",      "value": wo["store"]},
         ]
-    else:
-        body = [
-            {
-                "type": "TextBlock",
-                "size": "Large",
-                "weight": "Bolder",
-                "color": "Attention",
-                "text": f"⚠️ {run_label} — {len(wos)} Work Order{'s' if len(wos) != 1 else ''} Need Follow-Up",
-                "wrap": True,
-            },
-            {
-                "type": "TextBlock",
-                "text": (
-                    f"Work orders open **{STALE_DAYS}+ days** with no activity "
-                    f"in the last **{FOLLOWUP_DAYS} days**. "
-                    f"Please contact the Store Manager, Landlord, or Vendor."
-                ),
-                "wrap": True,
-                "isSubtle": True,
-                "spacing": "None",
-            },
+        if wo["address"]:
+            facts.append({"name": "Address",   "value": wo["address"]})
+        facts += [
+            {"name": "Problem",    "value": wo["description"] or "(no description)"},
+            {"name": "Priority",   "value": wo["priority"] or "Not set"},
+            {"name": "Status",     "value": status_display},
+            {"name": "Days Open",  "value": str(wo["days_old"])},
+            {"name": "Last Update","value": urgency},
+            {"name": "Provider",   "value": wo["provider"]},
+            {"name": "Scheduled",  "value": wo["scheduled_date"] or "Not scheduled"},
         ]
 
-        for wo in wos:
-            status_display = wo["status"]
-            if wo["status_ext"]:
-                status_display += f" / {wo['status_ext']}"
-
-            if wo["days_since_update"] > 30:
-                urgency_icon = "🔴"
-                urgency_text = f"No update in **{wo['days_since_update']} days** — URGENT"
-            else:
-                urgency_icon = "🟠"
-                urgency_text = f"No update in **{wo['days_since_update']} days**"
-
-            facts = [
-                {"title": "WO #",      "value": str(wo["number"])},
-                {"title": "Store",     "value": wo["store"]},
-            ]
-            if wo["address"]:
-                facts.append({"title": "Address",  "value": wo["address"]})
-            facts += [
-                {"title": "Problem",   "value": wo["description"] or "(no description)"},
-                {"title": "Priority",  "value": wo["priority"] or "Not set"},
-                {"title": "Status",    "value": status_display},
-                {"title": "Open",      "value": f"{wo['days_old']} days"},
-                {"title": "Last Activity", "value": urgency_text},
-                {"title": "Provider",  "value": wo["provider"]},
-                {"title": "Scheduled", "value": wo["scheduled_date"] or "Not scheduled"},
-            ]
-
-            body += [
-                {"type": "Separator"},
-                {
-                    "type": "TextBlock",
-                    "weight": "Bolder",
-                    "text": f"{urgency_icon} WO #{wo['number']} — {wo['store']}",
-                    "wrap": True,
-                    "spacing": "Medium",
-                },
-                {
-                    "type": "FactSet",
-                    "facts": facts,
-                    "spacing": "Small",
-                },
-            ]
+        sections.append({
+            "activityTitle":    f"**WO #{wo['number']}** — {wo['store']}",
+            "activitySubtitle": f"{wo['trade']}  ·  Open **{wo['days_old']} days**  ·  {urgency}",
+            "facts":            facts,
+            "markdown":         True,
+        })
 
     return {
-        "type": "message",
-        "attachments": [
-            {
-                "contentType": "application/vnd.microsoft.card.adaptive",
-                "contentUrl": None,
-                "content": {
-                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                    "type": "AdaptiveCard",
-                    "version": "1.2",
-                    "body": body,
-                },
-            }
-        ],
+        "@type":      "MessageCard",
+        "@context":   "https://schema.org/extensions",
+        "themeColor": "FF6B35",
+        "summary":    f"{len(wos)} work orders need follow-up",
+        "title":      f"⚠️ {run_label} — {len(wos)} Work Order{'s' if len(wos) != 1 else ''} Need Follow-Up",
+        "text": (
+            f"Open **{STALE_DAYS}+ days** with no activity in the last **{FOLLOWUP_DAYS} days**. "
+            f"Please contact the Store Manager, Landlord, or Vendor."
+        ),
+        "sections": sections,
     }
 
 
 # ── Send to Teams ─────────────────────────────────────────────────────────────
 
-async def send_teams_notification(wos: list[dict], run_label: str) -> bool:
+async def send_teams_notification(wos: list[dict], run_label: str) -> tuple[bool, int, str]:
+    """Send card to Teams. Returns (success, http_status, response_body)."""
     if not TEAMS_WEBHOOK:
         logger.warning("TEAMS_WEBHOOK_URL not set — skipping Teams notification")
-        return False
+        return False, 0, "TEAMS_WEBHOOK_URL not configured"
 
     card = _build_teams_card(wos, run_label)
     async with httpx.AsyncClient(timeout=15) as client:
@@ -255,17 +207,17 @@ async def send_teams_notification(wos: list[dict], run_label: str) -> bool:
         )
 
     logger.info(
-        "Teams webhook response: status=%s body=%s",
+        "Teams webhook response: status=%s body=%r",
         resp.status_code,
         resp.text[:300],
     )
 
     if resp.is_success:
         logger.info("Teams notification sent — %d stale WOs", len(wos))
-        return True
+        return True, resp.status_code, resp.text
 
     logger.error("Teams notification failed: %s %s", resp.status_code, resp.text)
-    return False
+    return False, resp.status_code, resp.text
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────

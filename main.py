@@ -253,8 +253,13 @@ async def test_webhook(x_api_secret: Optional[str] = Header(default=None)):
             "days_since_update": 18,
         }
     ]
-    ok = await send_teams_notification(sample, "Webhook Test")
-    return {"status": "ok" if ok else "failed", "webhook_configured": bool(os.getenv("TEAMS_WEBHOOK_URL"))}
+    ok, http_status, body = await send_teams_notification(sample, "Webhook Test")
+    return {
+        "status":              "ok" if ok else "failed",
+        "webhook_configured":  bool(os.getenv("TEAMS_WEBHOOK_URL")),
+        "teams_http_status":   http_status,
+        "teams_response_body": body,
+    }
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
