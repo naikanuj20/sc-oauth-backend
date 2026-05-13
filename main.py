@@ -21,7 +21,8 @@ from tokens import (
     require_auth, get_valid_token, _do_refresh
 )
 from workorders import router as wo_router
-from notifier import run_stale_check, send_teams_notification
+from notifier import run_stale_check, send_teams_notification, fetch_all_active_workorders
+from notion_sync import sync_workorders, upsert_workorder
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 logger = logging.getLogger(__name__)
@@ -50,21 +51,53 @@ async def start_scheduler():
         tz = pytz.utc
         logger.warning("Invalid NOTIFY_TZ '%s', falling back to UTC", NOTIFY_TZ)
 
+    async def _notion_daily_sync():
+        """Full Notion sync — upserts every active WO into the tracker database."""
+        logger.info("Starting daily Notion sync")
+        try:
+            wos = await fetch_all_active_workorders()
+            result = await sync_workorders(wos)
+            logger.info("Daily Notion sync complete: %s", result)
+        except Exception:
+            logger.exception("Daily Notion sync failed")
+
+    async def _stale_check_and_sync(label: str):
+        """Stale WO check → Teams alert, then refresh Notion."""
+        await run_stale_check(label)
+        try:
+            wos = await fetch_all_active_workorders()
+            result = await sync_workorders(wos)
+            logger.info("Notion sync after %s: %s", label, result)
+        except Exception:
+            logger.exception("Notion sync failed after %s", label)
+
     scheduler = AsyncIOScheduler(timezone=tz)
+
+    # 8 AM — full Notion sync (all active WOs refreshed before the workday starts)
     scheduler.add_job(
-        run_stale_check,
+        _notion_daily_sync,
+        CronTrigger(hour=8, minute=0, timezone=tz),
+        id="notion_daily_sync",
+    )
+    # 9 AM — stale WO check → Teams alert + Notion refresh
+    scheduler.add_job(
+        _stale_check_and_sync,
         CronTrigger(hour=9, minute=0, timezone=tz),
         args=["Morning Check (9 AM)"],
         id="morning_check",
     )
+    # 3 PM — stale WO check → Teams alert + Notion refresh
     scheduler.add_job(
-        run_stale_check,
+        _stale_check_and_sync,
         CronTrigger(hour=15, minute=0, timezone=tz),
         args=["Afternoon Check (3 PM)"],
         id="afternoon_check",
     )
     scheduler.start()
-    logger.info("Scheduler started — checks at 9 AM and 3 PM %s", NOTIFY_TZ)
+    logger.info(
+        "Scheduler started — Notion sync 8 AM, Teams checks 9 AM & 3 PM (%s)",
+        NOTIFY_TZ,
+    )
 
 # ── OAuth: Authorization Code flow ────────────────────────────────────────────
 _pending_states: dict[str, float] = {}
@@ -260,6 +293,53 @@ async def test_webhook(x_api_secret: Optional[str] = Header(default=None)):
         "teams_http_status":   http_status,
         "teams_response_body": body,
     }
+
+
+# ── Notion sync endpoints ────────────────────────────────────────────────────
+
+@app.post("/notion/sync", summary="Sync all active WOs from ServiceChannel into Notion, grouped by Trade", tags=["Notion"])
+async def notion_sync(x_api_secret: Optional[str] = Header(default=None)):
+    require_auth(x_api_secret)
+    wos = await fetch_all_active_workorders()
+    result = await sync_workorders(wos)
+    return {"total_fetched": len(wos), **result}
+
+
+@app.post("/notion/sync-wo/{wo_id}", summary="Sync a single WO into Notion by its ServiceChannel ID", tags=["Notion"])
+async def notion_sync_one(wo_id: int, x_api_secret: Optional[str] = Header(default=None)):
+    require_auth(x_api_secret)
+    token = await get_valid_token()
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(
+            f"{os.getenv('SC_API_BASE', 'https://api.servicechannel.com')}/v3/odata/workorders({wo_id})",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        )
+    if not resp.is_success:
+        raise HTTPException(resp.status_code, f"SC API error: {resp.text}")
+    raw = resp.json()
+    status   = raw.get("Status")   or {}
+    location = raw.get("Location") or raw.get("Store") or {}
+    provider = raw.get("Provider") or {}
+    priority_raw = raw.get("Priority") or ""
+    priority = priority_raw.get("Name") if isinstance(priority_raw, dict) else str(priority_raw).strip()
+    address_parts = [str(location.get(f, "")).strip() for f in ["Address", "City", "State", "ZipCode"] if location.get(f)]
+    wo = {
+        "id":           raw.get("Id"),
+        "number":       raw.get("Number") or raw.get("Id"),
+        "store":        location.get("Name") or str(location.get("StoreId", "")),
+        "address":      ", ".join(address_parts),
+        "trade":        raw.get("Trade", ""),
+        "priority":     priority,
+        "status":       status.get("Primary", ""),
+        "status_ext":   status.get("Extended", ""),
+        "provider":     provider.get("Name") or "Unassigned",
+        "description":  (raw.get("Description") or "")[:200],
+        "call_date":    (raw.get("CallDate") or "")[:10],
+        "scheduled_date": (raw.get("ScheduledDate") or "")[:10],
+        "nte":          raw.get("Nte") or raw.get("NTE"),
+    }
+    ok = await upsert_workorder(wo)
+    return {"status": "synced" if ok else "failed", "wo_number": wo["number"]}
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
