@@ -129,69 +129,86 @@ async def find_stale_workorders() -> list[dict]:
 
 # ── Full active WO fetch (for Notion sync) ───────────────────────────────────
 
+def _parse_wo(wo: dict, now: datetime) -> dict:
+    """Flatten a raw SC WO dict into our standard shape."""
+    status   = wo.get("Status")   or {}
+    location = wo.get("Location") or wo.get("Store") or {}
+    provider = wo.get("Provider") or {}
+
+    address_parts = []
+    for field in ["Address", "City", "State", "ZipCode", "Zip"]:
+        val = location.get(field)
+        if val:
+            address_parts.append(str(val).strip())
+
+    priority_raw = wo.get("Priority") or ""
+    if isinstance(priority_raw, dict):
+        priority = priority_raw.get("Name") or priority_raw.get("Primary") or ""
+    else:
+        priority = str(priority_raw).strip()
+
+    return {
+        "id":             wo.get("Id"),
+        "number":         wo.get("Number") or wo.get("Id"),
+        "store":          location.get("Name") or str(location.get("StoreId", "Unknown")),
+        "address":        ", ".join(address_parts),
+        "trade":          wo.get("Trade", ""),
+        "priority":       priority,
+        "status":         status.get("Primary", ""),
+        "status_ext":     status.get("Extended", ""),
+        "provider":       provider.get("Name") or "Unassigned",
+        "description":    (wo.get("Description") or "")[:200],
+        "call_date":      (wo.get("CallDate") or "")[:10],
+        "scheduled_date": (wo.get("ScheduledDate") or "")[:10],
+        "nte":            wo.get("Nte") or wo.get("NTE"),
+    }
+
+
 async def fetch_all_active_workorders() -> list[dict]:
-    """Fetch ALL open/in-progress WOs for the Notion tracker (up to 200)."""
+    """Fetch ALL open/in-progress WOs using OData pagination (follows @odata.nextLink)."""
     token = await get_valid_token()
     now   = datetime.now(timezone.utc)
 
     raw_filter = "(Status/Primary eq 'OPEN' or Status/Primary eq 'IN PROGRESS')"
-    url = (
+    first_url = (
         f"{SC_API}/v3/odata/workorders"
         f"?$filter={quote(raw_filter)}"
         f"&$orderby=CallDate desc"
-        f"&$top=200"
+        f"&$top=50"
     )
 
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     timeout = httpx.Timeout(SC_TIMEOUT, connect=15)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        for attempt in range(2):
-            try:
-                resp = await client.get(url, headers=headers)
-                break
-            except httpx.ReadTimeout:
-                if attempt == 1:
-                    raise HTTPException(504, "SC API timed out fetching active WOs")
-                await asyncio.sleep(2)
-
-    if not resp.is_success:
-        raise HTTPException(resp.status_code, f"SC API error: {resp.text}")
-
     result = []
-    for wo in resp.json().get("value", []):
-        status   = wo.get("Status")   or {}
-        location = wo.get("Location") or wo.get("Store") or {}
-        provider = wo.get("Provider") or {}
 
-        address_parts = []
-        for field in ["Address", "City", "State", "ZipCode", "Zip"]:
-            val = location.get(field)
-            if val:
-                address_parts.append(str(val).strip())
-        address = ", ".join(address_parts)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        url: str | None = first_url
+        page = 0
+        while url:
+            page += 1
+            for attempt in range(2):
+                try:
+                    resp = await client.get(url, headers=headers)
+                    break
+                except httpx.ReadTimeout:
+                    if attempt == 1:
+                        logger.error("SC API timed out on page %d of active WOs", page)
+                        return result  # return what we have so far
+                    await asyncio.sleep(2)
 
-        priority_raw = wo.get("Priority") or ""
-        if isinstance(priority_raw, dict):
-            priority = priority_raw.get("Name") or priority_raw.get("Primary") or ""
-        else:
-            priority = str(priority_raw).strip()
+            if not resp.is_success:
+                logger.error("SC API error on page %d: %s %s", page, resp.status_code, resp.text[:200])
+                break
 
-        result.append({
-            "id":           wo.get("Id"),
-            "number":       wo.get("Number") or wo.get("Id"),
-            "store":        location.get("Name") or str(location.get("StoreId", "Unknown")),
-            "address":      address,
-            "trade":        wo.get("Trade", ""),
-            "priority":     priority,
-            "status":       status.get("Primary", ""),
-            "status_ext":   status.get("Extended", ""),
-            "provider":     provider.get("Name") or "Unassigned",
-            "description":  (wo.get("Description") or "")[:200],
-            "call_date":    (wo.get("CallDate") or "")[:10],
-            "scheduled_date": (wo.get("ScheduledDate") or "")[:10],
-            "nte":          wo.get("Nte") or wo.get("NTE"),
-        })
+            data = resp.json()
+            batch = data.get("value", [])
+            result.extend(_parse_wo(wo, now) for wo in batch)
+            logger.info("Fetched page %d: %d WOs (total so far: %d)", page, len(batch), len(result))
 
+            # Follow the next page link if present
+            url = data.get("@odata.nextLink")
+
+    logger.info("fetch_all_active_workorders complete: %d total WOs", len(result))
     return result
 
 

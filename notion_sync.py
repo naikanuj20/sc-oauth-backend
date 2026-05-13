@@ -3,6 +3,7 @@ ServiceChannel → Notion sync.
 Upserts work orders into the Ascend Grocery tracker database.
 Secure: NOTION_API_KEY is read from env only — never logged or returned in responses.
 """
+import asyncio
 import logging
 import os
 from typing import Optional
@@ -158,23 +159,39 @@ def _build_properties(wo: dict) -> dict:
     return props
 
 
-async def _find_page_id(client: httpx.AsyncClient, wo_number: str) -> Optional[str]:
-    resp = await client.post(
-        f"{NOTION_API}/databases/{NOTION_DB_ID}/query",
-        headers=_headers(),
-        json={
-            "filter": {"property": "Work Order #", "title": {"equals": wo_number}},
-            "page_size": 1,
-        },
-    )
-    if resp.is_success:
-        results = resp.json().get("results", [])
-        if results:
-            return results[0]["id"]
-    return None
+async def _bulk_fetch_existing_pages() -> dict[str, str]:
+    """Return {wo_number: page_id} for every non-archived page in the DB (one sweep)."""
+    existing: dict[str, str] = {}
+    has_more = True
+    cursor = None
+    async with httpx.AsyncClient(timeout=60) as client:
+        while has_more:
+            payload: dict = {"page_size": 100}
+            if cursor:
+                payload["start_cursor"] = cursor
+            resp = await client.post(
+                f"{NOTION_API}/databases/{NOTION_DB_ID}/query",
+                headers=_headers(),
+                json=payload,
+            )
+            if not resp.is_success:
+                logger.error("Notion bulk page fetch failed: %s %s", resp.status_code, resp.text[:200])
+                break
+            data = resp.json()
+            for page in data.get("results", []):
+                if page.get("archived"):
+                    continue
+                title_arr = page.get("properties", {}).get("Work Order #", {}).get("title", [])
+                wo_num = title_arr[0].get("plain_text", "") if title_arr else ""
+                if wo_num:
+                    existing[wo_num] = page["id"]
+            has_more = data.get("has_more", False)
+            cursor = data.get("next_cursor")
+    logger.info("Notion bulk fetch: found %d existing pages", len(existing))
+    return existing
 
 
-async def upsert_workorder(wo: dict) -> bool:
+async def upsert_workorder(wo: dict, existing: Optional[dict] = None) -> bool:
     """Create or update a single Notion page for this WO. Returns True on success."""
     if not NOTION_API_KEY:
         logger.warning("NOTION_API_KEY not configured — skipping Notion sync")
@@ -184,7 +201,18 @@ async def upsert_workorder(wo: dict) -> bool:
     props = _build_properties(wo)
 
     async with httpx.AsyncClient(timeout=15) as client:
-        page_id = await _find_page_id(client, wo_number)
+        page_id = (existing or {}).get(wo_number)
+        if page_id is None:
+            # Fall back to individual query only when no bulk map provided
+            resp = await client.post(
+                f"{NOTION_API}/databases/{NOTION_DB_ID}/query",
+                headers=_headers(),
+                json={"filter": {"property": "Work Order #", "title": {"equals": wo_number}}, "page_size": 1},
+            )
+            if resp.is_success:
+                results = resp.json().get("results", [])
+                page_id = results[0]["id"] if results else None
+
         if page_id:
             resp = await client.patch(
                 f"{NOTION_API}/pages/{page_id}",
@@ -211,13 +239,21 @@ async def upsert_workorder(wo: dict) -> bool:
 async def sync_workorders(wos: list[dict]) -> dict:
     """Upsert active WOs to Notion then archive any that are no longer active."""
     if not NOTION_API_KEY:
-        return {"skipped": True, "reason": "NOTION_API_KEY not configured"}
+        return {"skipped": True, "reason": "NOTION_API_KEY not set in Railway environment variables"}
+
+    # One bulk query to find all existing pages — avoids N individual queries
+    existing = await _bulk_fetch_existing_pages()
+
     ok = fail = 0
-    for wo in wos:
-        if await upsert_workorder(wo):
+    for i, wo in enumerate(wos):
+        if await upsert_workorder(wo, existing):
             ok += 1
         else:
             fail += 1
+        # Notion rate limit: ~3 req/sec — pause briefly every 10 WOs
+        if i > 0 and i % 10 == 0:
+            await asyncio.sleep(0.5)
+
     logger.info("Notion batch sync complete: %d synced, %d failed", ok, fail)
 
     active_numbers = {str(wo.get("number") or wo.get("id", "")) for wo in wos}
