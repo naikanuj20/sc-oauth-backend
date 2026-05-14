@@ -24,7 +24,7 @@ from tokens import (
 )
 from workorders import router as wo_router
 from notifier import run_stale_check, send_teams_notification, fetch_all_active_workorders
-from notion_sync import sync_workorders, upsert_workorder, query_recently_edited_pages
+from notion_sync import sync_workorders, upsert_workorder, query_recently_edited_pages, clear_notes_to_sc
 
 SC_API = os.getenv("SC_API_BASE", "https://api.servicechannel.com")
 
@@ -97,15 +97,26 @@ async def start_scheduler():
         except Exception:
             logger.exception("Notion sync failed after %s", label)
 
+    # Notion priority label → SC priority string
+    _NOTION_PRIORITY_TO_SC = {
+        "P1 (2-4 HOURS)": "P1 - Emergency",
+        "P2 (24 HOURS)":  "P2 - Urgent",
+        "P3 (48 HOURS)":  "P3 - 24 Hours",
+        "PM":             "PM",
+    }
+
     async def _notion_to_sc_sync():
         """
-        Poll Notion for pages edited in the last 12 minutes.
-        If Status changed (and the change wasn't made by our own sync), push it to SC.
+        Poll Notion every 10 min for user-edited pages.
+        Pushes Status changes, Priority changes, and Notes to SC back to ServiceChannel.
+        Skips pages that were last edited by our own SC→Notion sync (anti-loop).
         """
-        # Skip changes that were written by our own SC→Notion sync (+ 2 min buffer)
+        # Use the later of (now-12min) or (last_sync+2min) as the query window start.
+        # This prevents picking up changes our own sync just wrote.
         ignore_before = _last_sc_to_notion + timedelta(minutes=2)
         since_dt = datetime.now(timezone.utc) - timedelta(minutes=12)
-        since_iso = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        effective_since = max(since_dt, ignore_before)
+        since_iso = effective_since.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         try:
             pages = await query_recently_edited_pages(since_iso)
@@ -114,19 +125,11 @@ async def start_scheduler():
             return
 
         for entry in pages:
-            wo_num = entry["wo_num"]
-            notion_status = entry["status"].upper()
-            note = entry.get("note", "")
-
-            sc_map = _NOTION_TO_SC.get(notion_status)
-            if not sc_map:
-                continue
-
-            # Only process changes that happened after our last SC→Notion push
-            # (prevents circular updates when we write to Notion ourselves)
-            if since_dt < ignore_before:
-                logger.debug("Notion→SC: skipping WO #%s — likely written by our own sync", wo_num)
-                continue
+            wo_num          = entry["wo_num"]
+            notion_status   = entry["status"].upper() if entry.get("status") else ""
+            notion_priority = entry.get("priority", "").upper()
+            note            = entry.get("note", "").strip()
+            page_id         = entry.get("page_id", "")
 
             try:
                 wo_id = int(wo_num.replace("WO-", "").strip())
@@ -134,37 +137,79 @@ async def start_scheduler():
                 continue
 
             token = await get_valid_token()
-            headers = {"Authorization": f"Bearer {token}", "Accept": "application/json",
-                       "Content-Type": "application/json"}
+            headers = {
+                "Authorization":  f"Bearer {token}",
+                "Accept":         "application/json",
+                "Content-Type":   "application/json",
+            }
+
             async with httpx.AsyncClient(timeout=15) as client:
-                # Fetch current SC status to avoid no-op pushes
                 sc_resp = await client.get(f"{SC_API}/v3/workorders/{wo_id}", headers=headers)
                 if not sc_resp.is_success:
+                    logger.warning("Notion→SC: could not fetch WO #%s from SC (%s)", wo_num, sc_resp.status_code)
                     continue
                 sc_wo = sc_resp.json()
-                sc_primary = (sc_wo.get("Status") or {}).get("Primary", "").upper()
+
+                sc_primary  = (sc_wo.get("Status") or {}).get("Primary", "").upper()
                 sc_extended = (sc_wo.get("Status") or {}).get("Extended", "").upper()
                 sc_combined = f"{sc_primary}:{sc_extended}" if sc_extended else sc_primary
+                sc_priority = str(sc_wo.get("Priority") or "").strip()
 
-                if sc_combined == notion_status:
-                    continue  # Already in sync, nothing to push
+                # ── 1. Status change ─────────────────────────────────────────
+                sc_map = _NOTION_TO_SC.get(notion_status) if notion_status else None
+                if sc_map and sc_combined != notion_status:
+                    payload: dict = {"Status": {"Primary": sc_map["primary"]}}
+                    if sc_map.get("extended"):
+                        payload["Status"]["Extended"] = sc_map["extended"]
+                    if note:
+                        payload["Note"] = note
 
-                payload: dict = {"Status": {"Primary": sc_map["primary"]}}
-                if sc_map.get("extended"):
-                    payload["Status"]["Extended"] = sc_map["extended"]
-                if note:
-                    payload["Note"] = note
-
-                upd = await client.put(
-                    f"{SC_API}/v3/workorders/{wo_id}/status", headers=headers, json=payload
-                )
-                if upd.is_success:
-                    logger.info(
-                        "Notion→SC: WO #%s status updated %s → %s",
-                        wo_num, sc_combined, notion_status,
+                    upd = await client.put(
+                        f"{SC_API}/v3/workorders/{wo_id}/status", headers=headers, json=payload
                     )
-                else:
-                    logger.error("Notion→SC: update failed for WO #%s: %s", wo_num, upd.text[:200])
+                    if upd.is_success:
+                        logger.info("Notion→SC: WO #%s status %s → %s", wo_num, sc_combined, notion_status)
+                    else:
+                        logger.error("Notion→SC: status update failed WO #%s: %s", wo_num, upd.text[:200])
+
+                    # Note was included in the status payload — don't double-send
+                    note = ""
+
+                # ── 2. Priority change ───────────────────────────────────────
+                sc_priority_target = _NOTION_PRIORITY_TO_SC.get(notion_priority, "") if notion_priority else ""
+                if sc_priority_target and not sc_priority.upper().startswith(notion_priority[:2]):
+                    upd = await client.put(
+                        f"{SC_API}/v3/workorders/{wo_id}/priority",
+                        headers=headers,
+                        json={"Priority": sc_priority_target},
+                    )
+                    if upd.is_success:
+                        logger.info("Notion→SC: WO #%s priority → %s", wo_num, sc_priority_target)
+                    else:
+                        # Fallback: some SC versions embed priority in the general WO update
+                        upd2 = await client.put(
+                            f"{SC_API}/v3/workorders/{wo_id}",
+                            headers=headers,
+                            json={"Priority": sc_priority_target},
+                        )
+                        if upd2.is_success:
+                            logger.info("Notion→SC: WO #%s priority → %s (via general update)", wo_num, sc_priority_target)
+                        else:
+                            logger.warning("Notion→SC: priority update not supported for WO #%s", wo_num)
+
+                # ── 3. Notes to SC ───────────────────────────────────────────
+                if note:
+                    note_resp = await client.post(
+                        f"{SC_API}/v3/workorders/{wo_id}/notes",
+                        headers=headers,
+                        json={"Note": note},
+                    )
+                    if note_resp.is_success:
+                        logger.info("Notion→SC: note pushed for WO #%s", wo_num)
+                        if page_id:
+                            await clear_notes_to_sc(page_id)
+                    else:
+                        logger.error("Notion→SC: note push failed WO #%s: %s", wo_num, note_resp.text[:200])
 
     scheduler = AsyncIOScheduler(timezone=tz)
 

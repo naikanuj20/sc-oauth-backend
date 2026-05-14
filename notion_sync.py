@@ -303,7 +303,7 @@ async def archive_completed_pages(active_wo_numbers: set) -> int:
 
 
 async def query_recently_edited_pages(since_iso: str) -> list[dict]:
-    """Return pages in the tracker DB edited after `since_iso` (ISO timestamp)."""
+    """Return pages edited after `since_iso`, including status, priority, and notes."""
     if not NOTION_API_KEY:
         return []
     results = []
@@ -334,13 +334,30 @@ async def query_recently_edited_pages(since_iso: str) -> list[dict]:
                 props = page.get("properties", {})
                 title_arr = props.get("Work Order #", {}).get("title", [])
                 wo_num = title_arr[0].get("plain_text", "") if title_arr else ""
-                status_sel = props.get("Status", {}).get("select") or {}
-                notion_status = status_sel.get("name", "")
-                # Notes field (if user typed a note in Notion to push to SC)
+                notion_status  = (props.get("Status",   {}).get("select")   or {}).get("name", "")
+                notion_priority = (props.get("Priority", {}).get("select")   or {}).get("name", "")
                 note_arr = props.get("Notes to SC", {}).get("rich_text", [])
                 note = note_arr[0].get("plain_text", "") if note_arr else ""
-                if wo_num and notion_status:
-                    results.append({"wo_num": wo_num, "status": notion_status, "note": note})
+                if wo_num:
+                    results.append({
+                        "page_id":  page["id"],
+                        "wo_num":   wo_num,
+                        "status":   notion_status,
+                        "priority": notion_priority,
+                        "note":     note,
+                    })
             has_more = data.get("has_more", False)
             cursor = data.get("next_cursor")
     return results
+
+
+async def clear_notes_to_sc(page_id: str) -> None:
+    """Wipe the 'Notes to SC' field after the note has been pushed to ServiceChannel."""
+    if not NOTION_API_KEY:
+        return
+    async with httpx.AsyncClient(timeout=10) as client:
+        await client.patch(
+            f"{NOTION_API}/pages/{page_id}",
+            headers=_headers(),
+            json={"properties": {"Notes to SC": {"rich_text": []}}},
+        )
